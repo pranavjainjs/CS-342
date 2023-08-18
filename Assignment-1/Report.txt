@@ -1,0 +1,6 @@
+1. When the client is run without the server run before in TCP, the result is given below:
+    Oops! Sorry, couldn't connect to the server. Please try again :(
+Reason: There is no server for it to connect
+
+2. When the client is run without the server run before in UDP, it goes into an infinite loop i.e., the client keeps sending the message,
+but it won't be received since there is no server.
