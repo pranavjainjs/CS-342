@@ -7,86 +7,11 @@
 #include <arpa/inet.h>  // inet_addr , inet_ntoa , ntohs htons
 #include <unistd.h>     // getpid
 #include "dns.h"        // custom header file
-#include <string>
-
-using std::string;
 
 char dns_server[20];          // dns server
 char IPaddress[10][20];       // list of IP addresses received
 int k = 0;                    // number of IP addresses received
 struct RES_RECORD answers[8]; // the replies from the DNS server
-
-struct LinkedList
-{
-    string url;
-    char *results;
-    LinkedList *next;
-
-    LinkedList() // constructor
-    {
-        url = "";
-        next = NULL;
-    }
-};
-
-LinkedList *cache = new LinkedList();
-
-// Check if a node exists in current Linked List or not...
-LinkedList *In_Cache(string url)
-{
-    LinkedList *root = cache;
-    while (root != NULL)
-    {
-        if (root->url == url)
-        {
-            return root;
-        }
-        root = root->next;
-    }
-    return NULL;
-}
-
-// Insert a node at start of Linked List....
-void Insert(LinkedList *&node)
-{
-    if (cache->next == NULL)
-    {
-        cache->next = node;
-        return;
-    }
-    LinkedList *temp = cache->next;
-    cache->next = node;
-    node->next = temp;
-}
-
-// Delete a node....
-void Delete(LinkedList *&node)
-{
-    LinkedList *root = cache;
-    LinkedList *prev = root;
-    LinkedList *ahead = node->next;
-    while (root != node)
-    {
-        prev = root;
-        root = root->next;
-    }
-    prev->next = ahead;
-}
-
-// Evict the least recently used node from end of list..
-void LRU_evict()
-{
-    LinkedList *root = cache;
-    LinkedList *prev = root;
-    while (root->next != NULL)
-    {
-        prev = root;
-        root = root->next;
-    }
-    prev->next = NULL;
-}
-
-void gethostbyname(unsigned char *host, int query_type, LinkedList *&node);
 
 int sz = 0;
 
@@ -171,13 +96,19 @@ int main(int argc, char *argv[])
     return 0;
 }
 
-// extract from node and print IPs
+// read results from cache and print IPs
 void extract_result(char *res)
 {
     std::cout << "\033[32m"
               << "\nFound the following IPs :-"
               << "\033[0m" << std::endl;
     int i = 0;
+    if (res[i] == 0)
+    {
+        std::cout << "The domain name does not exist." << std::endl;
+        std::cout << "Try again with a valid domain name." << std::endl;
+        exit(1);
+    }
     while (res[i] != 0)
     {
         if (res[i] == '#')
@@ -208,6 +139,17 @@ void gethostbyname(unsigned char *host, int query_type, LinkedList *&node)
 
     s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP); // UDP connection with DNS server
 
+    // Set a timeout for receive operations (in seconds)
+    struct timeval timeout;
+    timeout.tv_sec = 2; // 2 seconds
+    timeout.tv_usec = 0;
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
+        perror("Error setting receive timeout");
+        close(s);
+        return;
+    }
+
     serv.sin_family = AF_INET;
     serv.sin_port = htons(53);
     serv.sin_addr.s_addr = inet_addr(dns_server); // dns servers
@@ -234,7 +176,7 @@ void gethostbyname(unsigned char *host, int query_type, LinkedList *&node)
 
     // point to the query portion
     qname = (unsigned char *)&buf[sizeof(struct DNS_HEADER)];
-    ChangetoDnsNameFormat(qname, host);
+    ModifyHostnameToDNF(qname, host);
 
     // query field
     qinfo = (struct QUESTION *)&buf[sizeof(struct DNS_HEADER) + (strlen((const char *)qname) + 1)]; // fill it
@@ -243,7 +185,7 @@ void gethostbyname(unsigned char *host, int query_type, LinkedList *&node)
     qinfo->qclass = htons(1);         // internet
 
     // Sending the query
-    std::cout << "\nSending Packet... ";
+    std::cout << "\nSending Packet to DNS server...\n";
     if (sendto(s, (char *)buf, sizeof(struct DNS_HEADER) + (strlen((const char *)qname) + 1) + sizeof(struct QUESTION), 0, (struct sockaddr *)&serv, sizeof(serv)) < 0)
     {
         perror("sendto failed");
@@ -252,10 +194,17 @@ void gethostbyname(unsigned char *host, int query_type, LinkedList *&node)
 
     // Receive the answer
     i = sizeof(serv);
-    std::cout << "\nReceiving answer... ";
-    if (recvfrom(s, (char *)buf, 65536, 0, (struct sockaddr *)&serv, (socklen_t *)&i) < 0)
+    std::cout << "\nFetching IPs...\n";
+    if (recvfrom(s, (char *)buf, 65536, 0, (struct sockaddr *)&serv, (socklen_t *)&i) < 0) // in case of no response from DNS
     {
-        perror("recvfrom failed");
+        std::cout << "Timeout: No response from the server within the specified timeout." << std::endl;
+        std::cout << "Possible reasons" << std::endl;
+        std::cout << "\t1. Domain does not exist." << std::endl;
+        std::cout << "\t2. You are not connected to internet." << std::endl;
+        std::cout << "\t3. DNS server is not authorized by your ISP." << std::endl;
+        std::cout << "\t4. Packet was dropped due to network congestion." << std::endl;
+        close(s);
+        exit(1);
     }
     std::cout << "Done";
 
@@ -298,7 +247,7 @@ void read_answers(unsigned char buf[], unsigned char *reader, struct DNS_HEADER 
     for (i = 0; i < ntohs(dns->ans_count); i++)
     {
         int len;
-        answers[i].name = ReadName(reader, buf, &stop);
+        answers[i].name = DecodeResponse(reader, buf, &stop);
         reader = reader + stop;
 
         answers[i].resource = (struct R_DATA *)(reader);
@@ -309,15 +258,18 @@ void read_answers(unsigned char buf[], unsigned char *reader, struct DNS_HEADER 
             len = ntohs(answers[i].resource->data_len);
             answers[i].rdata = new unsigned char[len];
 
-            for (j = 0; j < len; j++)
+            j = 0;
+            while (j < len) // copying data to answers[i] array
             {
                 answers[i].rdata[j] = reader[j];
+                j++;
             }
             answers[i].rdata[len] = '\0';
 
             long *p;
             p = (long *)answers[i].rdata;
             a.sin_addr.s_addr = (*p); // working without ntohl
+
             if (k < 10)
                 strcpy(IPaddress[k++], inet_ntoa(a.sin_addr));
 
@@ -325,14 +277,14 @@ void read_answers(unsigned char buf[], unsigned char *reader, struct DNS_HEADER 
         }
         else // if its not an IPv4 address
         {
-            answers[i].rdata = ReadName(reader, buf, &stop);
+            answers[i].rdata = DecodeResponse(reader, buf, &stop);
             reader = reader + stop;
         }
     }
 }
 
 // Read website names in DNS formats and converts them into hostname
-unsigned char *ReadName(unsigned char *reader, unsigned char *buffer, int *count)
+unsigned char *DecodeResponse(unsigned char *reader, unsigned char *buffer, int *count)
 {
     unsigned char *name = new unsigned char[256];
     unsigned int p = 0, jumped = 0, offset;
@@ -342,7 +294,7 @@ unsigned char *ReadName(unsigned char *reader, unsigned char *buffer, int *count
 
     name[0] = '\0';
 
-    // read the names in 3www8facebook3com format
+    // read the names in 3www7netflix3com format
     while (*reader != 0)
     {
         if (*reader >= 192)
@@ -366,7 +318,7 @@ unsigned char *ReadName(unsigned char *reader, unsigned char *buffer, int *count
     if (jumped == 1)
         *count = *count + 1; // number of steps we actually moved forward in the packet
 
-    // now convert 3www8facebook3com to www.facebook.com
+    // now convert 3www7netflix3com to www.netflix.com
     for (i = 0; i < (int)strlen((const char *)name); i++)
     {
         p = name[i];
@@ -381,22 +333,23 @@ unsigned char *ReadName(unsigned char *reader, unsigned char *buffer, int *count
     return name;
 }
 
-/* This will convert www.facebook.com to 3www8facebook3com */
-void ChangetoDnsNameFormat(unsigned char *dns, unsigned char *host)
+/* This will convert www.netflix.com to 3www7netflix3com */
+void ModifyHostnameToDNF(unsigned char *dns, unsigned char *host)
 {
-    int lock = 0, i;
+    int tag = 0, i;
     strcat((char *)host, ".");
 
     for (i = 0; i < strlen((char *)host); i++)
     {
         if (host[i] == '.')
         {
-            *dns++ = i - lock;
-            for (; lock < i; lock++)
+            *dns++ = i - tag;
+            for (; tag < i; tag++)
             {
-                *dns++ = host[lock];
+                *dns++ = host[tag];
             }
-            lock++; // or lock=i+1;
+            // tag++;
+            tag = i + 1;
         }
     }
     *dns++ = '\0';
