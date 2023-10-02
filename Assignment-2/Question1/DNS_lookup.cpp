@@ -185,7 +185,7 @@ void gethostbyname(unsigned char *host, int query_type, LinkedList *&node)
     qinfo->qclass = htons(1);         // internet
 
     // Sending the query
-    std::cout << "\nSending Packet to DNS server...\n";
+    std::cout << "\nSending Packet to DNS server...";
     if (sendto(s, (char *)buf, sizeof(struct DNS_HEADER) + (strlen((const char *)qname) + 1) + sizeof(struct QUESTION), 0, (struct sockaddr *)&serv, sizeof(serv)) < 0)
     {
         perror("sendto failed");
@@ -194,7 +194,7 @@ void gethostbyname(unsigned char *host, int query_type, LinkedList *&node)
 
     // Receive the answer
     i = sizeof(serv);
-    std::cout << "\nFetching IPs...\n";
+    std::cout << "\nFetching IPs...";
     if (recvfrom(s, (char *)buf, 65536, 0, (struct sockaddr *)&serv, (socklen_t *)&i) < 0) // in case of no response from DNS
     {
         std::cout << "Timeout: No response from the server within the specified timeout." << std::endl;
